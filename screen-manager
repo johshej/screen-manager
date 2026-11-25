@@ -1,0 +1,670 @@
+#!/usr/bin/env bash
+#
+# screen-manager
+#
+# Interactive screen selection. The tab line shows every connected screen in
+# its physical order: the screens that are on from left to right (mirrored
+# screens together), followed by the screens that are off. Left/Right moves
+# between screens, Up/Down moves between the options of the selected screen,
+# Enter applies the highlighted option, q quits.
+#
+# Screens are named after their EDID: "Dell (U3423WE)". Identical names get the
+# suffix a, b, c, ... Screens without EDID are named after their output.
+#
+# The state is read from xrandr when the script starts and then kept live: when
+# screens are plugged in, unplugged or changed (by this script or anything
+# else) the screens and their options update by themselves, so only options
+# that are possible right now can be selected.
+#
+# The screens that are on always form one row, packed from the left edge, in
+# the order shown. Options:
+#   off                    offered while another screen stays on; for the only
+#                          screen that is on it is offered when another connected
+#                          screen can be turned on instead, and that one is
+#                          turned on in the same step so no screen is left dark
+#   on                     only offered for an off screen when no screen is on
+#   mirror <screen>        join that screen; only offered when they share a resolution
+#   add left of <screen>   put the screen in the row directly left of that screen
+#   add right of <screen>  put the screen in the row directly right of that screen
+#                          (the option also names the screen it ends up left of)
+
+set -u
+
+if ! command -v xrandr >/dev/null 2>&1; then
+  echo "xrandr is not installed" >&2
+  exit 1
+fi
+
+if [[ ! -t 0 || ! -t 1 ]]; then
+  echo "screen-manager needs an interactive terminal" >&2
+  exit 1
+fi
+
+readonly refresh_interval=1        # seconds between cheap state checks
+readonly probe_interval=5          # seconds between full probes of the connectors
+readonly maximum_model_length=12
+
+declare -a base_names=() screen_names=() active_names=() group_members=()
+declare -A screen_active=() position_x=() position_y=() width=() height=() preferred_mode=() mode_list=()
+declare -A edid_vendor=() edid_model=() edid_product=() screen_label=() group_index=() vendor_cache=()
+declare -a option_screen=() option_action=() option_reference=() option_text=()
+declare -A first_option=() screen_option_count=()
+group_count=0
+option_count=0
+vendor_result=""
+snapshot=""
+status_message=""
+cursor_screen_index=0
+cursor_option_offset=0
+
+# One line per connected output:
+# name|geometry|preferred mode|comma separated modes|EDID vendor|EDID model|EDID product
+# Without --current xrandr probes the connectors again, which finds newly plugged screens.
+query_screens() {
+  xrandr --prop "$@" 2>/dev/null | awk '
+    function hexvalue(character) { return index("0123456789abcdef", tolower(character)) - 1 }
+    function byte(position) {
+      return hexvalue(substr(edid, 2 * position + 1, 1)) * 16 + hexvalue(substr(edid, 2 * position + 2, 1))
+    }
+    function decode_edid(   value, block, offset, position, character, text) {
+      manufacturer = ""; model = ""; product = ""
+      if (length(edid) < 256) return
+      value = byte(8) * 256 + byte(9)
+      manufacturer = sprintf("%c%c%c", 64 + int(value / 1024) % 32, 64 + int(value / 32) % 32, 64 + value % 32)
+      product = sprintf("0x%04x", byte(11) * 256 + byte(10))
+      for (block = 0; block < 4; block++) {
+        offset = 54 + 18 * block
+        if (byte(offset) == 0 && byte(offset + 1) == 0 && byte(offset + 2) == 0 && byte(offset + 3) == 252) {
+          text = ""
+          for (position = 5; position < 18; position++) {
+            character = byte(offset + position)
+            if (character == 10) break
+            text = text sprintf("%c", (character >= 32 && character < 127 && character != 124) ? character : 32)
+          }
+          model = text
+        }
+      }
+    }
+    function flush() {
+      if (name != "") {
+        if (preferred == "") preferred = first
+        decode_edid()
+        print name "|" geometry "|" preferred "|" modes "|" manufacturer "|" model "|" product
+      }
+      name = ""
+    }
+    /^[^ \t]/ {
+      flush()
+      if ($2 == "connected") {
+        name = $1; geometry = ""; preferred = ""; first = ""; modes = ""; edid = ""; in_edid = 0
+        if (match($0, /[0-9]+x[0-9]+\+[0-9]+\+[0-9]+/)) geometry = substr($0, RSTART, RLENGTH)
+      }
+      next
+    }
+    name != "" && /^\tEDID:/ { in_edid = 1; edid = ""; next }
+    name != "" && in_edid && /^\t\t[0-9a-fA-F]+[ \t]*$/ { edid = edid $1; next }
+    name != "" && /^ +[0-9]+x[0-9]+/ {
+      in_edid = 0
+      modes = modes (modes == "" ? "" : ",") $1
+      if (first == "") first = $1
+      if (preferred == "" && index($0, "+") > 0) preferred = $1
+      next
+    }
+    name != "" { in_edid = 0 }
+    END { flush() }
+  '
+}
+
+is_builtin() {
+  [[ $1 =~ ^(eDP|LVDS|DSI) ]]
+}
+
+is_active() {
+  [[ -n ${screen_active[$1]:-} ]]
+}
+
+display_name() {
+  echo "${screen_label[$1]:-$1}"
+}
+
+# Prints the members (a space separated list) without the given screen.
+without_member() {
+  local result="" member
+  for member in $1; do
+    [[ $member == "$2" ]] || result+="${result:+ }$member"
+  done
+  echo "$result"
+}
+
+# Prints the display names of a space separated list of screens, joined with " & ".
+members_label() {
+  local member result=""
+  for member in $1; do
+    result+="${result:+ & }$(display_name "$member")"
+  done
+  echo "$result"
+}
+
+# Sets vendor_result to the short vendor name for an EDID vendor id ("DEL" -> "Dell").
+resolve_vendor() {
+  local identifier=$1 full=""
+  if [[ -z ${vendor_cache[$identifier]:-} ]]; then
+    if command -v systemd-hwdb >/dev/null 2>&1; then
+      full=$(systemd-hwdb query "acpi:$identifier:" 2>/dev/null | sed -n 's/^ID_VENDOR_FROM_DATABASE=//p' | head -n 1)
+    fi
+    if [[ -z $full && -r /usr/share/hwdata/pnp.ids ]]; then
+      full=$(awk -F'\t' -v identifier="$identifier" '$1 == identifier { print $2; exit }' /usr/share/hwdata/pnp.ids)
+    fi
+    full=${full%% *}
+    full=${full%,}
+    full=${full%.}
+    vendor_cache[$identifier]=${full:-$identifier}
+  fi
+  vendor_result=${vendor_cache[$identifier]}
+}
+
+# Names every screen from its EDID; identical names get the suffix a, b, c, ...
+assign_labels() {
+  local alphabet=abcdefghijklmnopqrstuvwxyz name model label seen
+  local -a words=()
+  local -A base_label=() label_total=() label_seen=()
+  screen_label=()
+
+  for name in "${base_names[@]}"; do
+    if [[ -z ${edid_vendor[$name]} ]]; then
+      label=$name
+      is_builtin "$name" && label="Built-in ($name)"
+    else
+      resolve_vendor "${edid_vendor[$name]}"
+      model=${edid_model[$name]}
+      read -ra words <<<"$model"
+      model="${words[*]:-}"
+      if [[ ${model,,} == "${vendor_result,,} "* ]]; then
+        model=${model:${#vendor_result}+1}
+      fi
+      model=${model:0:maximum_model_length}
+      [[ -n $model ]] || model=${edid_product[$name]}
+      if is_builtin "$name"; then
+        label="Built-in ($vendor_result $model)"
+      else
+        label="$vendor_result ($model)"
+      fi
+    fi
+    base_label[$name]=$label
+    label_total[$label]=$(( ${label_total[$label]:-0} + 1 ))
+  done
+
+  for name in "${base_names[@]}"; do
+    label=${base_label[$name]}
+    if (( ${label_total[$label]} > 1 )); then
+      seen=$(( ${label_seen[$label]:-0} + 1 ))
+      label_seen[$label]=$seen
+      label+=" ${alphabet:seen-1:1}"
+    fi
+    screen_label[$name]=$label
+  done
+}
+
+# Fills the screen arrays from $snapshot.
+load_screens() {
+  base_names=()
+  screen_names=()
+  active_names=()
+  group_members=()
+  group_count=0
+  screen_active=()
+  position_x=()
+  position_y=()
+  width=()
+  height=()
+  preferred_mode=()
+  mode_list=()
+  edid_vendor=()
+  edid_model=()
+  edid_product=()
+  group_index=()
+
+  local -a builtin_names=() external_names=()
+  local name geometry preferred modes vendor model product
+  while IFS='|' read -r name geometry preferred modes vendor model product; do
+    [[ -n $name ]] || continue
+    if [[ $geometry =~ ^([0-9]+)x([0-9]+)\+([0-9]+)\+([0-9]+)$ ]]; then
+      screen_active[$name]=1
+      width[$name]=${BASH_REMATCH[1]}
+      height[$name]=${BASH_REMATCH[2]}
+      position_x[$name]=${BASH_REMATCH[3]}
+      position_y[$name]=${BASH_REMATCH[4]}
+      active_names+=("$name")
+    fi
+    preferred_mode[$name]=$preferred
+    mode_list[$name]=$modes
+    edid_vendor[$name]=$vendor
+    edid_model[$name]=$model
+    edid_product[$name]=$product
+    if is_builtin "$name"; then
+      builtin_names+=("$name")
+    else
+      external_names+=("$name")
+    fi
+  done <<<"$snapshot"
+
+  base_names=("${builtin_names[@]}" "${external_names[@]}")
+  assign_labels
+
+  # Groups: screens at the same position mirror each other. Groups are ordered left to right.
+  local x y previous_position=""
+  while read -r x y name; do
+    [[ -n $name ]] || continue
+    if [[ $x,$y == "$previous_position" ]]; then
+      group_members[$(( group_count - 1 ))]+=" $name"
+    else
+      group_members[$group_count]=$name
+      group_count=$(( group_count + 1 ))
+      previous_position=$x,$y
+    fi
+    group_index[$name]=$(( group_count - 1 ))
+  done < <(for name in "${active_names[@]}"; do printf '%s %s %s\n' "${position_x[$name]}" "${position_y[$name]}" "$name"; done | sort -s -n -k1,1 -k2,2)
+
+  # Display order: the screens that are on from left to right, then the screens that are off.
+  local group
+  for (( group = 0; group < group_count; group++ )); do
+    screen_names+=(${group_members[$group]})
+  done
+  for name in "${base_names[@]}"; do
+    is_active "$name" || screen_names+=("$name")
+  done
+}
+
+# Prints the mode the screen and all the given screens can show while mirroring (the
+# current mode of the given screens when possible, otherwise the largest shared mode).
+# Fails when none is shared.
+mirror_mode() {
+  local screen=$1 member mode best="" best_area=0 area
+  shift
+  local current="${width[$1]}x${height[$1]}"
+  if [[ ,${mode_list[$screen]}, == *",$current,"* ]]; then
+    echo "$current"
+    return 0
+  fi
+
+  local -a screen_modes=()
+  IFS=, read -ra screen_modes <<<"${mode_list[$screen]}"
+  for mode in "${screen_modes[@]}"; do
+    for member in "$@"; do
+      [[ ,${mode_list[$member]}, == *",$mode,"* ]] || continue 2
+    done
+    [[ $mode =~ ^([0-9]+)x([0-9]+) ]] || continue
+    area=$(( BASH_REMATCH[1] * BASH_REMATCH[2] ))
+    if (( area > best_area )); then
+      best=$mode
+      best_area=$area
+    fi
+  done
+  [[ -n $best ]] || return 1
+  echo "$best"
+}
+
+# The off screen that is turned on when the only active screen is turned off.
+replacement_screen() {
+  local candidate
+  for candidate in "${screen_names[@]}"; do
+    is_active "$candidate" && continue
+    [[ -n ${preferred_mode[$candidate]} ]] || continue
+    echo "$candidate"
+    return 0
+  done
+  return 1
+}
+
+add_option() {
+  option_count=$(( option_count + 1 ))
+  option_screen[$option_count]=$1
+  option_action[$option_count]=$2
+  option_reference[$option_count]=$3
+  option_text[$option_count]=$4
+}
+
+# Rebuilds the option arrays: what is possible right now, per screen.
+build_options() {
+  option_screen=()
+  option_action=()
+  option_reference=()
+  option_text=()
+  first_option=()
+  screen_option_count=()
+  option_count=0
+
+  local screen replacement count_before group members count slot reference text original_slot
+  local -a candidate_groups=() candidate_origins=()
+  for screen in "${screen_names[@]}"; do
+    first_option[$screen]=$(( option_count + 1 ))
+    count_before=$option_count
+
+    # The other groups, as they would look without this screen, left to right.
+    candidate_groups=()
+    candidate_origins=()
+    original_slot=-1
+    for (( group = 0; group < group_count; group++ )); do
+      members=$(without_member "${group_members[$group]}" "$screen")
+      if [[ -n $members ]]; then
+        candidate_groups+=("$members")
+        candidate_origins+=("$group")
+      else
+        original_slot=${#candidate_groups[@]} # the screen is alone in its group, here
+      fi
+    done
+    count=${#candidate_groups[@]}
+
+    if is_active "$screen"; then
+      if (( ${#active_names[@]} > 1 )); then
+        add_option "$screen" off "" "off"
+      elif replacement=$(replacement_screen); then
+        add_option "$screen" off "$replacement" "off (turns on $(display_name "$replacement"))"
+      fi
+    elif [[ -z ${preferred_mode[$screen]} ]]; then
+      screen_option_count[$screen]=0
+      continue
+    elif (( ${#active_names[@]} == 0 )); then
+      add_option "$screen" on "" "on"
+    fi
+
+    for (( group = 0; group < count; group++ )); do
+      if is_active "$screen" && [[ ${group_index[$screen]} == "${candidate_origins[$group]}" ]]; then
+        continue # already mirroring this group
+      fi
+      # shellcheck disable=SC2086 # the members are a space separated list
+      if mirror_mode "$screen" ${candidate_groups[$group]} >/dev/null; then
+        add_option "$screen" mirror "${candidate_groups[$group]%% *}" "mirror $(members_label "${candidate_groups[$group]}")"
+      fi
+    done
+
+    if (( count > 0 )); then
+      for (( slot = 0; slot <= count; slot++ )); do
+        (( slot == original_slot )) && continue # the screen is already there
+        if (( slot == 0 )); then
+          add_option "$screen" left "${candidate_groups[0]%% *}" "add left of $(members_label "${candidate_groups[0]}")"
+        else
+          text="add right of $(members_label "${candidate_groups[$(( slot - 1 ))]}")"
+          (( slot < count )) && text+=" (left of $(members_label "${candidate_groups[$slot]}"))"
+          add_option "$screen" right "${candidate_groups[$(( slot - 1 ))]%% *}" "$text"
+        fi
+      done
+    fi
+
+    screen_option_count[$screen]=$(( option_count - count_before ))
+  done
+}
+
+describe_screen() {
+  local screen=$1 mate text
+  if is_active "$screen"; then
+    text="output $screen, on ${width[$screen]}x${height[$screen]} at ${position_x[$screen]},${position_y[$screen]}"
+    for mate in ${group_members[${group_index[$screen]}]}; do
+      [[ $mate == "$screen" ]] || text+=", mirrors $(display_name "$mate")"
+    done
+  elif [[ -z ${preferred_mode[$screen]} ]]; then
+    text="output $screen, off, no modes available"
+  else
+    text="output $screen, off"
+  fi
+  printf '%s' "$text"
+}
+
+apply_option() {
+  local number=$1
+  local screen=${option_screen[$number]} action=${option_action[$number]} reference=${option_reference[$number]}
+  local -A new_mode=()
+  local -a layout_groups=("${group_members[@]}") remaining=() arguments=() parts=()
+  local members member mode index reference_index=-1 slot cursor_x=0 group_width member_width
+
+  # Take the screen out of the row.
+  for members in "${layout_groups[@]}"; do
+    members=$(without_member "$members" "$screen")
+    [[ -n $members ]] && remaining+=("$members")
+  done
+  layout_groups=("${remaining[@]}")
+
+  if [[ -n $reference ]]; then
+    for index in "${!layout_groups[@]}"; do
+      [[ " ${layout_groups[$index]} " == *" $reference "* ]] && reference_index=$index
+    done
+  fi
+
+  case $action in
+    off)
+      arguments+=(--output "$screen" --off)
+      if [[ -n $reference ]]; then
+        new_mode[$reference]=${preferred_mode[$reference]}
+        layout_groups=("$reference")
+      fi
+      ;;
+    on)
+      new_mode[$screen]=${preferred_mode[$screen]}
+      layout_groups=("$screen")
+      ;;
+    mirror)
+      # shellcheck disable=SC2086 # the members are a space separated list
+      mode=$(mirror_mode "$screen" ${layout_groups[$reference_index]})
+      for member in ${layout_groups[$reference_index]}; do
+        [[ $mode == "${width[$member]}x${height[$member]}" ]] || new_mode[$member]=$mode
+      done
+      new_mode[$screen]=$mode
+      layout_groups[$reference_index]+=" $screen"
+      ;;
+    left|right)
+      slot=$reference_index
+      [[ $action == right ]] && slot=$(( slot + 1 ))
+      is_active "$screen" || new_mode[$screen]=${preferred_mode[$screen]}
+      layout_groups=("${layout_groups[@]:0:slot}" "$screen" "${layout_groups[@]:slot}")
+      ;;
+  esac
+
+  # Lay the row out from the left edge, top aligned.
+  for members in "${layout_groups[@]}"; do
+    group_width=0
+    for member in $members; do
+      if [[ -n ${new_mode[$member]:-} ]]; then
+        [[ ${new_mode[$member]} =~ ^([0-9]+)x ]]
+        member_width=${BASH_REMATCH[1]}
+      else
+        member_width=${width[$member]}
+      fi
+      parts=()
+      [[ -n ${new_mode[$member]:-} ]] && parts+=(--mode "${new_mode[$member]}")
+      if ! is_active "$member" || [[ ${position_x[$member]} != "$cursor_x" || ${position_y[$member]} != 0 ]]; then
+        parts+=(--pos "${cursor_x}x0")
+      fi
+      (( ${#parts[@]} > 0 )) && arguments+=(--output "$member" "${parts[@]}")
+      (( member_width > group_width )) && group_width=$member_width
+    done
+    cursor_x=$(( cursor_x + group_width ))
+  done
+
+  local command_text error_text
+  printf -v command_text '%q ' xrandr "${arguments[@]}"
+  if error_text=$(xrandr "${arguments[@]}" 2>&1); then
+    status_message="Applied: ${command_text% }"
+  else
+    status_message="Failed: ${error_text:-xrandr returned an error} (${command_text% })"
+  fi
+}
+
+# --- cursor ---------------------------------------------------------------
+
+selected_option_number() {
+  local screen=${screen_names[$cursor_screen_index]:-}
+  [[ -n $screen ]] || return 1
+  (( ${screen_option_count[$screen]:-0} > 0 )) || return 1
+  echo $(( ${first_option[$screen]} + cursor_option_offset ))
+}
+
+selected_option_key() {
+  local number
+  number=$(selected_option_number) || return 0
+  echo "${option_action[$number]}:${option_reference[$number]}"
+}
+
+# Puts the cursor back on the same screen and option after the lists were rebuilt.
+restore_cursor() {
+  local previous_screen=$1 previous_key=$2 previous_offset=$3 index screen count offset
+
+  cursor_screen_index=0
+  for index in "${!screen_names[@]}"; do
+    [[ ${screen_names[$index]} == "$previous_screen" ]] && cursor_screen_index=$index
+  done
+  screen=${screen_names[$cursor_screen_index]:-}
+  cursor_option_offset=0
+  [[ -n $screen ]] || return 0
+
+  count=${screen_option_count[$screen]}
+  if [[ $screen == "$previous_screen" ]]; then
+    cursor_option_offset=$previous_offset
+    for (( offset = 0; offset < count; offset++ )); do
+      index=$(( ${first_option[$screen]} + offset ))
+      if [[ -n $previous_key && ${option_action[$index]}:${option_reference[$index]} == "$previous_key" ]]; then
+        cursor_option_offset=$offset
+        break
+      fi
+    done
+  fi
+  (( cursor_option_offset >= count )) && cursor_option_offset=$(( count > 0 ? count - 1 : 0 ))
+  return 0
+}
+
+move_screen() {
+  local target=$(( cursor_screen_index + $1 ))
+  (( target >= 0 && target < ${#screen_names[@]} )) || return 0
+  cursor_screen_index=$target
+  cursor_option_offset=0
+}
+
+move_option() {
+  local screen=${screen_names[$cursor_screen_index]:-} target
+  [[ -n $screen ]] || return 0
+  target=$(( cursor_option_offset + $1 ))
+  (( target >= 0 && target < ${screen_option_count[$screen]} )) || return 0
+  cursor_option_offset=$target
+}
+
+# --- state ----------------------------------------------------------------
+
+# Rebuilds screens and options from $snapshot, keeping the cursor where it was.
+rebuild() {
+  local previous_screen="" previous_key="" previous_offset=$cursor_option_offset
+  if (( ${#screen_names[@]} > 0 )); then
+    previous_screen=${screen_names[$cursor_screen_index]:-}
+    previous_key=$(selected_option_key)
+  fi
+  load_screens
+  build_options
+  restore_cursor "$previous_screen" "$previous_key" "$previous_offset"
+}
+
+# Reads the current state; returns 0 when it differs from what is shown.
+refresh() {
+  local new_snapshot
+  new_snapshot=$(query_screens "$@")
+  [[ $new_snapshot == "$snapshot" ]] && return 1
+  snapshot=$new_snapshot
+  rebuild
+  return 0
+}
+
+# --- screen ---------------------------------------------------------------
+
+render() {
+  local output=$'\e[H' index screen label offset
+  local clear_line=$'\e[K'
+
+  output+=$'\e[36m'"screen-manager   Left/Right: screen   Up/Down: option   Enter: apply   q: quit"$'\e[0m'"${clear_line}"$'\n'
+  output+="${clear_line}"$'\n'
+
+  if (( ${#screen_names[@]} == 0 )); then
+    output+="No connected screens found${clear_line}"$'\n'
+  else
+    for index in "${!screen_names[@]}"; do
+      screen=${screen_names[$index]}
+      label="$(display_name "$screen") [$(is_active "$screen" && echo on || echo off)]"
+      if (( index == cursor_screen_index )); then
+        output+=$'\e[7m '"$label"$' \e[0m  '
+      else
+        output+=" $label  "
+      fi
+    done
+    output+="${clear_line}"$'\n'"${clear_line}"$'\n'
+
+    screen=${screen_names[$cursor_screen_index]}
+    output+=$'\e[1m'"$(display_name "$screen")"$'\e[0m'": $(describe_screen "$screen")${clear_line}"$'\n'
+    output+="${clear_line}"$'\n'
+
+    if (( ${screen_option_count[$screen]} == 0 )); then
+      output+="  No options available${clear_line}"$'\n'
+    else
+      for (( offset = 0; offset < ${screen_option_count[$screen]}; offset++ )); do
+        label=${option_text[$(( ${first_option[$screen]} + offset ))]}
+        if (( offset == cursor_option_offset )); then
+          output+=$'\e[7m'"  > $label "$'\e[0m'"${clear_line}"$'\n'
+        else
+          output+="    $label${clear_line}"$'\n'
+        fi
+      done
+    fi
+  fi
+
+  output+="${clear_line}"$'\n'"${status_message}${clear_line}"$'\n'$'\e[J'
+  printf '%s' "$output"
+}
+
+restore_terminal() {
+  printf '\e[?25h\e[?1049l'
+}
+
+main() {
+  trap restore_terminal EXIT
+  trap 'exit 130' INT TERM
+  printf '\e[?1049h\e[?25l'
+
+  local key sequence status last_refresh=$SECONDS last_probe=$SECONDS selected
+  refresh
+  render
+
+  while true; do
+    if read -rsn1 -t "$refresh_interval" key; then
+      if [[ $key == $'\e' ]]; then
+        sequence=""
+        read -rsn2 -t 0.05 sequence
+        key=$sequence
+      fi
+      case $key in
+        q) break ;;
+        '[A'|'OA') move_option -1 ;;
+        '[B'|'OB') move_option 1 ;;
+        '[C'|'OC') move_screen 1 ;;
+        '[D'|'OD') move_screen -1 ;;
+        '')
+          if selected=$(selected_option_number); then
+            apply_option "$selected"
+            refresh
+            last_refresh=$SECONDS
+            last_probe=$SECONDS
+          fi
+          ;;
+      esac
+      render
+    else
+      status=$?
+      (( status > 128 )) || break # input closed
+    fi
+
+    if (( SECONDS - last_probe >= probe_interval )); then
+      last_probe=$SECONDS
+      last_refresh=$SECONDS
+      refresh && render
+    elif (( SECONDS - last_refresh >= refresh_interval )); then
+      last_refresh=$SECONDS
+      refresh --current && render
+    fi
+  done
+}
+
+main
