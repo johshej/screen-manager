@@ -8,6 +8,22 @@
 # between screens, Up/Down moves between the options of the selected screen,
 # Enter applies the highlighted option, q quits.
 #
+# Connections: the set of external screens that are connected (identified by
+# EDID vendor, product and serial number, so it does not matter which port or
+# dock they sit on) is a connection. The first tab, "Connection (...)", belongs
+# to it. A connection can be named, and the layout last applied here is saved
+# for it in ~/.config/screen-manager/connections. When a known connection shows
+# up (at start or when it is plugged in) the cursor lands on "restore saved
+# layout", so one Enter brings back the latest layout.
+#
+# i3 workspaces: when ~/.config/screen-manager/workspaces exists, the workspace
+# assignments of the screens that are on are written to ~/.config/i3/screens.conf
+# (include it from the i3 config) and i3 is reloaded when they change. The file
+# has one line per screen model: "vendor:product workspace ...", ranges like 1-10
+# allowed. A screen that is connected but off keeps its workspaces assigned (i3
+# applies them when it is turned on); the workspaces of a screen model that is not
+# connected at all go to the leftmost screen that is on.
+#
 # Screens are named after their EDID: "Dell (U3423WE)". Identical names get the
 # suffix a, b, c, ... Screens without EDID are named after their output.
 #
@@ -43,14 +59,22 @@ fi
 readonly refresh_interval=1        # seconds between cheap state checks
 readonly probe_interval=5          # seconds between full probes of the connectors
 readonly maximum_model_length=12
+readonly connection_entry="@connection"  # the tab of the connection, not an output
+readonly connections_file="${XDG_CONFIG_HOME:-$HOME/.config}/screen-manager/connections"
+readonly workspaces_file="${XDG_CONFIG_HOME:-$HOME/.config}/screen-manager/workspaces"
+readonly i3_screens_file="${XDG_CONFIG_HOME:-$HOME/.config}/i3/screens.conf"
 
-declare -a base_names=() screen_names=() active_names=() group_members=()
+declare -a base_names=() screen_names=() tab_names=() active_names=() group_members=()
 declare -A screen_active=() position_x=() position_y=() width=() height=() preferred_mode=() mode_list=()
-declare -A edid_vendor=() edid_model=() edid_product=() screen_label=() group_index=() vendor_cache=()
+declare -A edid_vendor=() edid_model=() edid_product=() edid_serial=() identity_of=()
+declare -A screen_label=() group_index=() vendor_cache=() connection_name=() connection_layout=()
 declare -a option_screen=() option_action=() option_reference=() option_text=()
 declare -A first_option=() screen_option_count=()
 group_count=0
 option_count=0
+connection_fingerprint=""
+apply_changed_layout=0
+status_row=1
 vendor_result=""
 snapshot=""
 status_message=""
@@ -58,7 +82,7 @@ cursor_screen_index=0
 cursor_option_offset=0
 
 # One line per connected output:
-# name|geometry|preferred mode|comma separated modes|EDID vendor|EDID model|EDID product
+# name|geometry|preferred mode|comma separated modes|EDID vendor|EDID model|EDID product|EDID serial
 # Without --current xrandr probes the connectors again, which finds newly plugged screens.
 query_screens() {
   xrandr --prop "$@" 2>/dev/null | awk '
@@ -66,22 +90,25 @@ query_screens() {
     function byte(position) {
       return hexvalue(substr(edid, 2 * position + 1, 1)) * 16 + hexvalue(substr(edid, 2 * position + 2, 1))
     }
-    function decode_edid(   value, block, offset, position, character, text) {
-      manufacturer = ""; model = ""; product = ""
+    function decode_edid(   value, block, offset, position, character, text, number) {
+      manufacturer = ""; model = ""; product = ""; serial = ""
       if (length(edid) < 256) return
       value = byte(8) * 256 + byte(9)
       manufacturer = sprintf("%c%c%c", 64 + int(value / 1024) % 32, 64 + int(value / 32) % 32, 64 + value % 32)
       product = sprintf("0x%04x", byte(11) * 256 + byte(10))
+      number = byte(15) * 16777216 + byte(14) * 65536 + byte(13) * 256 + byte(12)
+      if (number != 0) serial = sprintf("%d", number)
       for (block = 0; block < 4; block++) {
         offset = 54 + 18 * block
-        if (byte(offset) == 0 && byte(offset + 1) == 0 && byte(offset + 2) == 0 && byte(offset + 3) == 252) {
+        if (byte(offset) == 0 && byte(offset + 1) == 0 && byte(offset + 2) == 0 && (byte(offset + 3) == 252 || byte(offset + 3) == 255)) {
           text = ""
           for (position = 5; position < 18; position++) {
             character = byte(offset + position)
             if (character == 10) break
             text = text sprintf("%c", (character >= 32 && character < 127 && character != 124) ? character : 32)
           }
-          model = text
+          gsub(/^ +| +$/, "", text)
+          if (byte(offset + 3) == 252) model = text; else if (text != "") serial = text
         }
       }
     }
@@ -89,7 +116,7 @@ query_screens() {
       if (name != "") {
         if (preferred == "") preferred = first
         decode_edid()
-        print name "|" geometry "|" preferred "|" modes "|" manufacturer "|" model "|" product
+        print name "|" geometry "|" preferred "|" modes "|" manufacturer "|" model "|" product "|" serial
       }
       name = ""
     }
@@ -222,11 +249,13 @@ load_screens() {
   edid_vendor=()
   edid_model=()
   edid_product=()
+  edid_serial=()
+  identity_of=()
   group_index=()
 
-  local -a builtin_names=() external_names=()
-  local name geometry preferred modes vendor model product
-  while IFS='|' read -r name geometry preferred modes vendor model product; do
+  local -a builtin_names=() external_names=() external_identities=()
+  local name geometry preferred modes vendor model product serial
+  while IFS='|' read -r name geometry preferred modes vendor model product serial; do
     [[ -n $name ]] || continue
     if [[ $geometry =~ ^([0-9]+)x([0-9]+)\+([0-9]+)\+([0-9]+)$ ]]; then
       screen_active[$name]=1
@@ -241,6 +270,7 @@ load_screens() {
     edid_vendor[$name]=$vendor
     edid_model[$name]=$model
     edid_product[$name]=$product
+    edid_serial[$name]=$serial
     if is_builtin "$name"; then
       builtin_names+=("$name")
     else
@@ -250,6 +280,23 @@ load_screens() {
 
   base_names=("${builtin_names[@]}" "${external_names[@]}")
   assign_labels
+
+  # The identity of a screen does not depend on the port or dock it sits on.
+  for name in "${base_names[@]}"; do
+    if is_builtin "$name"; then
+      identity_of[$name]=builtin
+    elif [[ -n ${edid_vendor[$name]} ]]; then
+      identity_of[$name]="${edid_vendor[$name]}:${edid_product[$name]}:${edid_serial[$name]:--}"
+      external_identities+=("${identity_of[$name]}")
+    else
+      identity_of[$name]="output:$name"
+      external_identities+=("${identity_of[$name]}")
+    fi
+  done
+  connection_fingerprint=""
+  if (( ${#external_identities[@]} > 0 )); then
+    connection_fingerprint=$(printf '%s\n' "${external_identities[@]}" | sort | paste -sd+)
+  fi
 
   # Groups: screens at the same position mirror each other. Groups are ordered left to right.
   local x y previous_position=""
@@ -273,6 +320,193 @@ load_screens() {
   for name in "${base_names[@]}"; do
     is_active "$name" || screen_names+=("$name")
   done
+
+  # Tabs: the connection first (when something external is connected), then the screens.
+  tab_names=()
+  if [[ -n $connection_fingerprint ]]; then
+    local title=unnamed
+    connection_is_known || title=new
+    [[ -z ${connection_name[$connection_fingerprint]:-} ]] || title=${connection_name[$connection_fingerprint]}
+    screen_label[$connection_entry]="Connection ($title)"
+    tab_names+=("$connection_entry")
+  fi
+  tab_names+=("${screen_names[@]}")
+}
+
+# --- i3 workspaces --------------------------------------------------------
+
+# Prints the connected screen (on or off) with the given vendor:product; fails when there is none.
+screen_for_model() {
+  local name
+  for name in "${base_names[@]}"; do
+    if [[ ${edid_vendor[$name]}:${edid_product[$name]} == "$1" ]]; then
+      echo "$name"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Writes the workspace assignments of the screens that are on to the i3 include file and
+# reloads i3 when they changed.
+update_workspace_assignments() {
+  [[ -r $workspaces_file ]] || return 0
+  (( group_count > 0 )) || return 0
+
+  local line model rest token index start end number target content
+  local -a models=() workspace_lists=()
+  local -A workspace_output=()
+
+  while IFS= read -r line; do
+    line=${line%%\#*}
+    read -r model rest <<<"$line"
+    [[ -n $model && -n $rest ]] || continue
+    models+=("$model")
+    workspace_lists+=("$rest")
+  done <"$workspaces_file"
+  (( ${#models[@]} > 0 )) || return 0
+
+  for index in "${!models[@]}"; do
+    target=$(screen_for_model "${models[$index]}") || target=${group_members[0]%% *}
+    for token in ${workspace_lists[$index]}; do
+      if [[ $token =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        start=${BASH_REMATCH[1]}
+        end=${BASH_REMATCH[2]}
+        for (( number = start; number <= end; number++ )); do
+          workspace_output[$number]=$target
+        done
+      elif [[ $token =~ ^[0-9]+$ ]]; then
+        workspace_output[$token]=$target
+      fi
+    done
+  done
+
+  content="# Generated by screen-manager from $workspaces_file. Do not edit."
+  for number in $(printf '%s\n' "${!workspace_output[@]}" | sort -n); do
+    content+=$'\n'"workspace $number output ${workspace_output[$number]}"
+  done
+
+  if [[ -r $i3_screens_file && $(<"$i3_screens_file") == "$content" ]]; then
+    return 0
+  fi
+  mkdir -p "${i3_screens_file%/*}" && printf '%s\n' "$content" >"$i3_screens_file" || return 0
+  if command -v i3-msg >/dev/null 2>&1 && i3-msg reload >/dev/null 2>&1; then
+    status_message+="${status_message:+ | }i3 workspaces updated"
+  fi
+}
+
+# --- connections ----------------------------------------------------------
+
+connection_is_known() {
+  [[ -n ${connection_layout[$connection_fingerprint]:-} ]]
+}
+
+# The layout that is on now: groups left to right separated by ",", mirrored screens
+# in a group joined by "&", each screen as identity@mode.
+current_layout() {
+  local group member group_text result=""
+  for (( group = 0; group < group_count; group++ )); do
+    group_text=""
+    for member in ${group_members[$group]}; do
+      group_text+="${group_text:+&}${identity_of[$member]}@${width[$member]}x${height[$member]}"
+    done
+    result+="${result:+,}$group_text"
+  done
+  echo "$result"
+}
+
+load_connections() {
+  connection_name=()
+  connection_layout=()
+  [[ -r $connections_file ]] || return 0
+  local fingerprint name layout
+  while IFS='|' read -r fingerprint name layout; do
+    [[ -n $fingerprint && -n $layout ]] || continue
+    connection_name[$fingerprint]=$name
+    connection_layout[$fingerprint]=$layout
+  done <"$connections_file"
+}
+
+save_connections() {
+  local fingerprint temporary
+  mkdir -p "${connections_file%/*}" || return 1
+  temporary=$(mktemp "$connections_file.XXXXXX") || return 1
+  for fingerprint in "${!connection_layout[@]}"; do
+    printf '%s|%s|%s\n' "$fingerprint" "${connection_name[$fingerprint]:-}" "${connection_layout[$fingerprint]}"
+  done | sort >"$temporary"
+  mv "$temporary" "$connections_file"
+}
+
+# Remembers the layout that is on now as the latest one of the current connection.
+save_current_connection() {
+  [[ -n $connection_fingerprint ]] || return 0
+  connection_layout[$connection_fingerprint]=$(current_layout)
+  save_connections
+}
+
+describe_connection() {
+  local name screens=""
+  for name in "${base_names[@]}"; do
+    is_builtin "$name" || screens+="${screens:+ + }$(display_name "$name")"
+  done
+  if ! connection_is_known; then
+    printf '%s, new connection (saved when you apply an option)' "$screens"
+  elif [[ ${connection_layout[$connection_fingerprint]} == "$(current_layout)" ]]; then
+    printf '%s, saved layout is in use' "$screens"
+  else
+    printf '%s, saved layout differs from the current layout' "$screens"
+  fi
+}
+
+name_connection() {
+  local entered="" word
+  local -a words=()
+  printf '\e[%d;1H\e[K\e[?25h' "$status_row"
+  read -r -e -p "Name for this connection (empty keeps the current name): " entered
+  printf '\e[?25l'
+  entered=${entered//[|$'\t']/ }
+  read -ra words <<<"$entered"
+  entered="${words[*]:-}"
+  [[ -n $entered ]] || return 0
+  connection_name[$connection_fingerprint]=$entered
+  connection_is_known || connection_layout[$connection_fingerprint]=$(current_layout)
+  save_connections
+  status_message="Named connection: $entered"
+}
+
+# Brings back the saved layout of the current connection.
+restore_layout() {
+  local saved=${connection_layout[$connection_fingerprint]} group_text token identity mode name members
+  local -a saved_groups=() tokens=() layout_groups=() arguments=()
+  local -A new_mode=() used=()
+
+  IFS=, read -ra saved_groups <<<"$saved"
+  for group_text in "${saved_groups[@]}"; do
+    members=""
+    IFS='&' read -ra tokens <<<"$group_text"
+    for token in "${tokens[@]}"; do
+      identity=${token%@*}
+      mode=${token##*@}
+      for name in "${base_names[@]}"; do
+        [[ ${identity_of[$name]} == "$identity" && -z ${used[$name]:-} ]] || continue
+        used[$name]=1
+        [[ ,${mode_list[$name]}, == *",$mode,"* ]] || mode=${preferred_mode[$name]}
+        new_mode[$name]=$mode
+        members+="${members:+ }$name"
+        break
+      done
+    done
+    [[ -z $members ]] || layout_groups+=("$members")
+  done
+
+  if (( ${#layout_groups[@]} == 0 )); then
+    status_message="Failed: none of the screens in the saved layout are connected"
+    return 0
+  fi
+  for name in "${active_names[@]}"; do
+    [[ -n ${used[$name]:-} ]] || arguments+=(--output "$name" --off)
+  done
+  run_layout
 }
 
 # Prints the mode the screen and all the given screens can show while mirroring (the
@@ -336,6 +570,21 @@ build_options() {
 
   local screen replacement count_before group members count slot reference text original_slot
   local -a candidate_groups=() candidate_origins=()
+
+  if [[ -n $connection_fingerprint ]]; then
+    first_option[$connection_entry]=$(( option_count + 1 ))
+    count_before=$option_count
+    if connection_is_known && [[ ${connection_layout[$connection_fingerprint]} != "$(current_layout)" ]]; then
+      add_option "$connection_entry" restore "" "restore saved layout"
+    fi
+    if [[ -n ${connection_name[$connection_fingerprint]:-} ]]; then
+      add_option "$connection_entry" name "" "rename connection"
+    else
+      add_option "$connection_entry" name "" "name connection"
+    fi
+    screen_option_count[$connection_entry]=$(( option_count - count_before ))
+  fi
+
   for screen in "${screen_names[@]}"; do
     first_option[$screen]=$(( option_count + 1 ))
     count_before=$option_count
@@ -414,8 +663,17 @@ apply_option() {
   local number=$1
   local screen=${option_screen[$number]} action=${option_action[$number]} reference=${option_reference[$number]}
   local -A new_mode=()
-  local -a layout_groups=("${group_members[@]}") remaining=() arguments=() parts=()
-  local members member mode index reference_index=-1 slot cursor_x=0 group_width member_width
+  local -a layout_groups=("${group_members[@]}") remaining=() arguments=()
+  local members member mode index reference_index=-1 slot
+
+  apply_changed_layout=0
+  if [[ $screen == "$connection_entry" ]]; then
+    case $action in
+      name) name_connection ;;
+      restore) restore_layout ;;
+    esac
+    return 0
+  fi
 
   # Take the screen out of the row.
   for members in "${layout_groups[@]}"; do
@@ -459,18 +717,30 @@ apply_option() {
       ;;
   esac
 
-  # Lay the row out from the left edge, top aligned.
+  run_layout
+}
+
+# Lays the row out from the left edge, top aligned, and applies it. Uses the caller's
+# layout_groups (groups of screens left to right), new_mode (modes to set) and
+# arguments (xrandr arguments so far, such as --off for screens to turn off).
+run_layout() {
+  local members member mode_text cursor_x=0 group_width member_width command_text error_text
+  local -a parts=()
+
   for members in "${layout_groups[@]}"; do
     group_width=0
     for member in $members; do
+      parts=()
       if [[ -n ${new_mode[$member]:-} ]]; then
-        [[ ${new_mode[$member]} =~ ^([0-9]+)x ]]
+        mode_text=${new_mode[$member]}
+        [[ $mode_text =~ ^([0-9]+)x ]]
         member_width=${BASH_REMATCH[1]}
+        if ! is_active "$member" || [[ $mode_text != "${width[$member]}x${height[$member]}" ]]; then
+          parts+=(--mode "$mode_text")
+        fi
       else
         member_width=${width[$member]}
       fi
-      parts=()
-      [[ -n ${new_mode[$member]:-} ]] && parts+=(--mode "${new_mode[$member]}")
       if ! is_active "$member" || [[ ${position_x[$member]} != "$cursor_x" || ${position_y[$member]} != 0 ]]; then
         parts+=(--pos "${cursor_x}x0")
       fi
@@ -480,10 +750,14 @@ apply_option() {
     cursor_x=$(( cursor_x + group_width ))
   done
 
-  local command_text error_text
+  if (( ${#arguments[@]} == 0 )); then
+    status_message="Nothing to change"
+    return 0
+  fi
   printf -v command_text '%q ' xrandr "${arguments[@]}"
   if error_text=$(xrandr "${arguments[@]}" 2>&1); then
     status_message="Applied: ${command_text% }"
+    apply_changed_layout=1
   else
     status_message="Failed: ${error_text:-xrandr returned an error} (${command_text% })"
   fi
@@ -492,7 +766,7 @@ apply_option() {
 # --- cursor ---------------------------------------------------------------
 
 selected_option_number() {
-  local screen=${screen_names[$cursor_screen_index]:-}
+  local screen=${tab_names[$cursor_screen_index]:-}
   [[ -n $screen ]] || return 1
   (( ${screen_option_count[$screen]:-0} > 0 )) || return 1
   echo $(( ${first_option[$screen]} + cursor_option_offset ))
@@ -509,10 +783,12 @@ restore_cursor() {
   local previous_screen=$1 previous_key=$2 previous_offset=$3 index screen count offset
 
   cursor_screen_index=0
-  for index in "${!screen_names[@]}"; do
-    [[ ${screen_names[$index]} == "$previous_screen" ]] && cursor_screen_index=$index
+  # Without a previous position start on the first screen, not on the connection.
+  [[ ${tab_names[0]:-} == "$connection_entry" ]] && (( ${#tab_names[@]} > 1 )) && cursor_screen_index=1
+  for index in "${!tab_names[@]}"; do
+    [[ ${tab_names[$index]} == "$previous_screen" ]] && cursor_screen_index=$index
   done
-  screen=${screen_names[$cursor_screen_index]:-}
+  screen=${tab_names[$cursor_screen_index]:-}
   cursor_option_offset=0
   [[ -n $screen ]] || return 0
 
@@ -533,13 +809,13 @@ restore_cursor() {
 
 move_screen() {
   local target=$(( cursor_screen_index + $1 ))
-  (( target >= 0 && target < ${#screen_names[@]} )) || return 0
+  (( target >= 0 && target < ${#tab_names[@]} )) || return 0
   cursor_screen_index=$target
   cursor_option_offset=0
 }
 
 move_option() {
-  local screen=${screen_names[$cursor_screen_index]:-} target
+  local screen=${tab_names[$cursor_screen_index]:-} target
   [[ -n $screen ]] || return 0
   target=$(( cursor_option_offset + $1 ))
   (( target >= 0 && target < ${screen_option_count[$screen]} )) || return 0
@@ -550,14 +826,23 @@ move_option() {
 
 # Rebuilds screens and options from $snapshot, keeping the cursor where it was.
 rebuild() {
+  local previous_fingerprint=$connection_fingerprint
   local previous_screen="" previous_key="" previous_offset=$cursor_option_offset
-  if (( ${#screen_names[@]} > 0 )); then
-    previous_screen=${screen_names[$cursor_screen_index]:-}
+  if (( ${#tab_names[@]} > 0 )); then
+    previous_screen=${tab_names[$cursor_screen_index]:-}
     previous_key=$(selected_option_key)
   fi
   load_screens
   build_options
   restore_cursor "$previous_screen" "$previous_key" "$previous_offset"
+  update_workspace_assignments
+
+  # A known connection that just showed up: default to restoring its latest layout.
+  if [[ -n $connection_fingerprint && $connection_fingerprint != "$previous_fingerprint" ]] \
+     && [[ ${option_action[${first_option[$connection_entry]}]:-} == restore ]]; then
+    cursor_screen_index=0
+    cursor_option_offset=0
+  fi
 }
 
 # Reads the current state; returns 0 when it differs from what is shown.
@@ -573,18 +858,22 @@ refresh() {
 # --- screen ---------------------------------------------------------------
 
 render() {
-  local output=$'\e[H' index screen label offset
+  local output=$'\e[H' index screen label offset newlines
   local clear_line=$'\e[K'
 
   output+=$'\e[36m'"screen-manager   Left/Right: screen   Up/Down: option   Enter: apply   q: quit"$'\e[0m'"${clear_line}"$'\n'
   output+="${clear_line}"$'\n'
 
-  if (( ${#screen_names[@]} == 0 )); then
+  if (( ${#tab_names[@]} == 0 )); then
     output+="No connected screens found${clear_line}"$'\n'
   else
-    for index in "${!screen_names[@]}"; do
-      screen=${screen_names[$index]}
-      label="$(display_name "$screen") [$(is_active "$screen" && echo on || echo off)]"
+    for index in "${!tab_names[@]}"; do
+      screen=${tab_names[$index]}
+      if [[ $screen == "$connection_entry" ]]; then
+        label=$(display_name "$screen")
+      else
+        label="$(display_name "$screen") [$(is_active "$screen" && echo on || echo off)]"
+      fi
       if (( index == cursor_screen_index )); then
         output+=$'\e[7m '"$label"$' \e[0m  '
       else
@@ -593,8 +882,13 @@ render() {
     done
     output+="${clear_line}"$'\n'"${clear_line}"$'\n'
 
-    screen=${screen_names[$cursor_screen_index]}
-    output+=$'\e[1m'"$(display_name "$screen")"$'\e[0m'": $(describe_screen "$screen")${clear_line}"$'\n'
+    screen=${tab_names[$cursor_screen_index]}
+    if [[ $screen == "$connection_entry" ]]; then
+      label=$(describe_connection)
+    else
+      label=$(describe_screen "$screen")
+    fi
+    output+=$'\e[1m'"$(display_name "$screen")"$'\e[0m'": ${label}${clear_line}"$'\n'
     output+="${clear_line}"$'\n'
 
     if (( ${screen_option_count[$screen]} == 0 )); then
@@ -612,6 +906,8 @@ render() {
   fi
 
   output+="${clear_line}"$'\n'"${status_message}${clear_line}"$'\n'$'\e[J'
+  newlines=${output//[!$'\n']/}
+  status_row=${#newlines}
   printf '%s' "$output"
 }
 
@@ -625,6 +921,7 @@ main() {
   printf '\e[?1049h\e[?25l'
 
   local key sequence status last_refresh=$SECONDS last_probe=$SECONDS selected
+  load_connections
   refresh
   render
 
@@ -645,6 +942,8 @@ main() {
           if selected=$(selected_option_number); then
             apply_option "$selected"
             refresh
+            (( apply_changed_layout )) && save_current_connection
+            rebuild # the connection tab and its options depend on what was just saved
             last_refresh=$SECONDS
             last_probe=$SECONDS
           fi
