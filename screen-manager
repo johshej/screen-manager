@@ -11,8 +11,10 @@
 # Connections: the set of external screens that are connected (identified by
 # EDID vendor, product and serial number, so it does not matter which port or
 # dock they sit on) is a connection. The first tab, "Connection (...)", belongs
-# to it. A connection can be named, and the layout last applied here is saved
-# for it in ~/.config/screen-manager/connections. When a known connection shows
+# to it. The connection gets a name at the top of the screen: the name you gave
+# it (r renames it), otherwise one found automatically (the dock, when a USB dock
+# is attached, otherwise the external screens). The layout last applied here is
+# saved for it in ~/.config/screen-manager/connections. When a known connection shows
 # up (at start or when it is plugged in) the cursor lands on "restore saved
 # layout", so one Enter brings back the latest layout.
 #
@@ -73,6 +75,8 @@ declare -A first_option=() screen_option_count=()
 group_count=0
 option_count=0
 connection_fingerprint=""
+connection_automatic_name=""
+dock_name=""
 apply_changed_layout=0
 status_row=1
 vendor_result=""
@@ -323,11 +327,11 @@ load_screens() {
 
   # Tabs: the connection first (when something external is connected), then the screens.
   tab_names=()
+  connection_automatic_name=""
   if [[ -n $connection_fingerprint ]]; then
-    local title=unnamed
-    connection_is_known || title=new
-    [[ -z ${connection_name[$connection_fingerprint]:-} ]] || title=${connection_name[$connection_fingerprint]}
-    screen_label[$connection_entry]="Connection ($title)"
+    find_dock_name
+    connection_automatic_name=${dock_name:-$(external_screens_text)}
+    screen_label[$connection_entry]="Connection"
     tab_names+=("$connection_entry")
   fi
   tab_names+=("${screen_names[@]}")
@@ -444,11 +448,47 @@ save_current_connection() {
   save_connections
 }
 
-describe_connection() {
+# Sets dock_name to the USB dock that is attached ("Lenovo ThinkPad USB-C Dock"), or "".
+find_dock_name() {
+  local device manufacturer_file product manufacturer=""
+  dock_name=""
+  for device in /sys/bus/usb/devices/*/product; do
+    [[ -r $device ]] || continue
+    read -r product <"$device" || continue
+    [[ ${product,,} == *dock* ]] || continue
+    product=${product% Audio}
+    manufacturer_file=${device%product}manufacturer
+    [[ -r $manufacturer_file ]] && read -r manufacturer <"$manufacturer_file"
+    if [[ -z $manufacturer || $product == "$manufacturer"* ]]; then
+      dock_name=$product
+    else
+      dock_name="$manufacturer $product"
+    fi
+    return 0
+  done
+}
+
+# Prints the display names of the connected external screens, joined with " + ".
+external_screens_text() {
   local name screens=""
   for name in "${base_names[@]}"; do
     is_builtin "$name" || screens+="${screens:+ + }$(display_name "$name")"
   done
+  echo "$screens"
+}
+
+# The name of the current connection: the saved name, otherwise the automatic one.
+connection_title() {
+  if [[ -n ${connection_name[$connection_fingerprint]:-} ]]; then
+    echo "${connection_name[$connection_fingerprint]}"
+  else
+    echo "$connection_automatic_name"
+  fi
+}
+
+describe_connection() {
+  local screens
+  screens=$(external_screens_text)
   if ! connection_is_known; then
     printf '%s, new connection (saved when you apply an option)' "$screens"
   elif [[ ${connection_layout[$connection_fingerprint]} == "$(current_layout)" ]]; then
@@ -458,16 +498,26 @@ describe_connection() {
   fi
 }
 
+# r: asks for a new name for the current connection, starting from the current name.
+rename_connection() {
+  if [[ -z $connection_fingerprint ]]; then
+    status_message="No external screens are connected, so there is no connection to rename"
+  else
+    name_connection
+  fi
+}
+
 name_connection() {
-  local entered="" word
+  local entered="" current
   local -a words=()
+  current=$(connection_title)
   printf '\e[%d;1H\e[K\e[?25h' "$status_row"
-  read -r -e -p "Name for this connection (empty keeps the current name): " entered
+  read -r -e -i "$current" -p "Connection name: " entered
   printf '\e[?25l'
   entered=${entered//[|$'\t']/ }
   read -ra words <<<"$entered"
   entered="${words[*]:-}"
-  [[ -n $entered ]] || return 0
+  [[ -n $entered && $entered != "$current" ]] || return 0
   connection_name[$connection_fingerprint]=$entered
   connection_is_known || connection_layout[$connection_fingerprint]=$(current_layout)
   save_connections
@@ -577,11 +627,7 @@ build_options() {
     if connection_is_known && [[ ${connection_layout[$connection_fingerprint]} != "$(current_layout)" ]]; then
       add_option "$connection_entry" restore "" "restore saved layout"
     fi
-    if [[ -n ${connection_name[$connection_fingerprint]:-} ]]; then
-      add_option "$connection_entry" name "" "rename connection"
-    else
-      add_option "$connection_entry" name "" "name connection"
-    fi
+    add_option "$connection_entry" name "" "rename connection"
     screen_option_count[$connection_entry]=$(( option_count - count_before ))
   fi
 
@@ -861,8 +907,14 @@ render() {
   local output=$'\e[H' index screen label offset newlines
   local clear_line=$'\e[K'
 
-  output+=$'\e[36m'"screen-manager   Left/Right: screen   Up/Down: option   Enter: apply   q: quit"$'\e[0m'"${clear_line}"$'\n'
-  output+="${clear_line}"$'\n'
+  output+=$'\e[36m'"screen-manager   Left/Right: screen   Up/Down: option   Enter: apply   r: rename connection   q: quit"$'\e[0m'"${clear_line}"$'\n'
+  if [[ -n $connection_fingerprint ]]; then
+    output+=$'\e[1m'"Connection: $(connection_title)"$'\e[0m'
+    [[ -n ${connection_name[$connection_fingerprint]:-} ]] || output+=$'\e[2m'"  (automatic name)"$'\e[0m'
+    output+="${clear_line}"$'\n'
+  else
+    output+="${clear_line}"$'\n'
+  fi
 
   if (( ${#tab_names[@]} == 0 )); then
     output+="No connected screens found${clear_line}"$'\n'
@@ -934,6 +986,7 @@ main() {
       fi
       case $key in
         q) break ;;
+        r) rename_connection ;;
         '[A'|'OA') move_option -1 ;;
         '[B'|'OB') move_option 1 ;;
         '[C'|'OC') move_screen 1 ;;
